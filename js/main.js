@@ -32,13 +32,38 @@ const BG_PALETTE = [
 ];
 let bgIndex = 0;
 
-// MIDI 键盘映射：Chromatic 半音阶，参考 Serum/Renoise/DAW 布局
-// 每行 12 半音 = 1 个八度。Z 行=C3, A 行=C4, Q 行=C5
-const KEY_TO_CELL = {
-  'z': 0, 'x': 1, 'c': 2, 'v': 3, 'b': 4, 'n': 5, 'm': 6, ',': 7, '.': 8, '/': 9, '\\': 10, '`': 11,
-  'a': 12, 's': 13, 'd': 14, 'f': 15, 'g': 16, 'h': 17, 'j': 18, 'k': 19, 'l': 20, ';': 21, "'": 22, '1': 23,
-  'q': 24, 'w': 25, 'e': 26, 'r': 27, 't': 28, 'y': 29, 'u': 30, 'i': 31, 'o': 32, 'p': 33, '[': 34, ']': 35,
+// QWERTY 键盘映射：全音阶（C D E F G A B），每键一个 whole note
+// Z行=C3~B3, A行=C4~D5, Q行=C5~E6。C/D/E/F 四个音持续（按住发声，松开停止）
+const KEY_TO_NOTE = {
+  'z': { midi: 48, cell: 0 },   // C3
+  'x': { midi: 50, cell: 1 },   // D3
+  'c': { midi: 52, cell: 2 },   // E3
+  'v': { midi: 53, cell: 3 },   // F3
+  'b': { midi: 55, cell: 4 },   // G3
+  'n': { midi: 57, cell: 5 },   // A3
+  'm': { midi: 59, cell: 6 },   // B3
+  'a': { midi: 60, cell: 7 },   // C4
+  's': { midi: 62, cell: 8 },   // D4
+  'd': { midi: 64, cell: 9 },   // E4
+  'f': { midi: 65, cell: 10 },  // F4
+  'g': { midi: 67, cell: 11 },  // G4
+  'h': { midi: 69, cell: 12 },  // A4
+  'j': { midi: 71, cell: 13 },  // B4
+  'k': { midi: 72, cell: 14 },  // C5
+  'l': { midi: 74, cell: 15 },  // D5
+  'q': { midi: 72, cell: 16 },  // C5
+  'w': { midi: 74, cell: 17 },  // D5
+  'e': { midi: 76, cell: 18 },  // E5
+  'r': { midi: 77, cell: 19 },  // F5
+  't': { midi: 79, cell: 20 },  // G5
+  'y': { midi: 81, cell: 21 },  // A5
+  'u': { midi: 83, cell: 22 },  // B5
+  'i': { midi: 84, cell: 23 },  // C6
+  'o': { midi: 86, cell: 24 },  // D6
+  'p': { midi: 88, cell: 25 },  // E6
 };
+// C(0), D(2), E(4), F(5) 在 12 半音中的偏移 → 持续音
+const SUSTAIN_OFFSETS = new Set([0, 2, 4, 5]);
 
 // Chromatic: cellIndex -> MIDI (C3=48, C4=60, C5=72)
 function midiToFreq(midiNote) {
@@ -46,21 +71,37 @@ function midiToFreq(midiNote) {
 }
 
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+const activeSustained = {}; // key -> { osc, gain }
 
-function playPlaceholderSound(index) {
-  const midiNote = 48 + index;
+function playPlaceholderSound(midiNote, cellIndex, sustained = false) {
   const baseFreq = midiToFreq(midiNote);
   const osc = audioCtx.createOscillator();
   const gain = audioCtx.createGain();
   osc.connect(gain);
   gain.connect(audioCtx.destination);
   osc.frequency.setValueAtTime(baseFreq, audioCtx.currentTime);
-  osc.type = ['sine', 'triangle', 'sine', 'triangle', 'square'][index % 5];
+  osc.type = ['sine', 'triangle', 'sine', 'triangle', 'square'][cellIndex % 5];
   gain.gain.setValueAtTime(0.12, audioCtx.currentTime);
+  if (sustained) {
+    gain.gain.exponentialRampToValueAtTime(0.06, audioCtx.currentTime + 0.05);
+    osc.start(audioCtx.currentTime);
+    return { osc, gain };
+  }
   gain.gain.exponentialRampToValueAtTime(0.08, audioCtx.currentTime + 0.05);
   gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
   osc.start(audioCtx.currentTime);
   osc.stop(audioCtx.currentTime + 0.25);
+}
+
+function stopSustained(key) {
+  const s = activeSustained[key];
+  if (s) {
+    const t = audioCtx.currentTime;
+    s.gain.gain.setValueAtTime(s.gain.gain.value, t);
+    s.gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
+    s.osc.stop(t + 0.08);
+    delete activeSustained[key];
+  }
 }
 
 // Two.js 场景
@@ -155,20 +196,29 @@ function bindEvents() {
     lastTriggeredCell = -1;
   });
 
-  // 键盘 MIDI 映射
+  // 键盘：全音阶 QWERTY，C/D/E/F 持续
   const keysPressed = new Set();
   document.addEventListener('keydown', (e) => {
     if (e.repeat) return;
     const key = e.key.toLowerCase();
-    const index = KEY_TO_CELL[key];
-    if (index !== undefined && !keysPressed.has(key)) {
+    const note = KEY_TO_NOTE[key];
+    if (note && !keysPressed.has(key)) {
       keysPressed.add(key);
       e.preventDefault();
-      triggerCell(index, { clientX: window.innerWidth / 2, clientY: window.innerHeight / 2 });
+      const sustained = SUSTAIN_OFFSETS.has(note.midi % 12);
+      triggerCell(note.cell, { clientX: window.innerWidth / 2, clientY: window.innerHeight / 2 }, {
+        midiNote: note.midi,
+        sustained,
+        key: sustained ? key : undefined,
+      });
     }
   });
   document.addEventListener('keyup', (e) => {
-    keysPressed.delete(e.key.toLowerCase());
+    const key = e.key.toLowerCase();
+    keysPressed.delete(key);
+    if (KEY_TO_NOTE[key] && SUSTAIN_OFFSETS.has(KEY_TO_NOTE[key].midi % 12)) {
+      stopSustained(key);
+    }
   });
 }
 
@@ -182,7 +232,7 @@ function getMousePos(e) {
   };
 }
 
-function triggerCell(index, e) {
+function triggerCell(index, e, opts = {}) {
   lastTriggeredCell = index;
 
   const nextBgIndex = (bgIndex + 1) % BG_PALETTE.length;
@@ -201,7 +251,16 @@ function triggerCell(index, e) {
   }
 
   cycleBackground(index);
-  playPlaceholderSound(index);
+  const midi = opts?.midiNote ?? 48 + index;
+  const sustained = opts?.sustained ?? false;
+  const key = opts?.key;
+  if (sustained && key) {
+    stopSustained(key);
+    const s = playPlaceholderSound(midi, index, true);
+    if (s) activeSustained[key] = s;
+  } else {
+    playPlaceholderSound(midi, index, false);
+  }
 
   // 同格点击：移除该格已有动画，重启动画而非叠加
   for (let i = shapes.length - 1; i >= 0; i--) {
