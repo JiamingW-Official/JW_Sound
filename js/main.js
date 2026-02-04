@@ -71,35 +71,168 @@ function midiToFreq(midiNote) {
 }
 
 const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
-const activeSustained = {}; // key -> { osc, gain }
+const activeSustained = {}; // key -> { oscs, gain, filter, lfo }
+let keysPressedCount = 0; // 用于和弦趣味检测
 
-function playPlaceholderSound(midiNote, cellIndex, sustained = false) {
+// 主输出：轻微延迟增加空间感
+const masterGain = audioCtx.createGain();
+masterGain.gain.setValueAtTime(1, audioCtx.currentTime);
+masterGain.connect(audioCtx.destination);
+const delay = audioCtx.createDelay(0.5);
+delay.delayTime.setValueAtTime(0.14, audioCtx.currentTime);
+const delayFeedback = audioCtx.createGain();
+delayFeedback.gain.setValueAtTime(0.22, audioCtx.currentTime);
+delay.connect(delayFeedback);
+delayFeedback.connect(delay);
+const delayMix = audioCtx.createGain();
+delayMix.gain.setValueAtTime(0.18, audioCtx.currentTime);
+masterGain.connect(delay);
+delay.connect(delayMix);
+delayMix.connect(audioCtx.destination);
+
+// ========== 高级合成器引擎 ==========
+// 双振荡器 + 滤波包络 + ADSR + 可选 Sub/颤音
+function createSynthVoice(midiNote, cellIndex, sustained, velocity = 1) {
+  const t = audioCtx.currentTime;
   const baseFreq = midiToFreq(midiNote);
-  const osc = audioCtx.createOscillator();
-  const gain = audioCtx.createGain();
-  osc.connect(gain);
-  gain.connect(audioCtx.destination);
-  osc.frequency.setValueAtTime(baseFreq, audioCtx.currentTime);
-  osc.type = ['sine', 'triangle', 'sine', 'triangle', 'square'][cellIndex % 5];
-  gain.gain.setValueAtTime(0.12, audioCtx.currentTime);
-  if (sustained) {
-    gain.gain.exponentialRampToValueAtTime(0.06, audioCtx.currentTime + 0.05);
-    osc.start(audioCtx.currentTime);
-    return { osc, gain };
+  const v = Math.max(0.3, Math.min(1, velocity));
+
+  // 主振荡器：根据音高选择波形，低音更厚、高音更亮
+  const oscTypes = ['triangle', 'sawtooth', 'triangle', 'sine', 'triangle'];
+  const osc1 = audioCtx.createOscillator();
+  osc1.type = oscTypes[cellIndex % oscTypes.length];
+  osc1.frequency.setValueAtTime(baseFreq, t);
+  osc1.detune?.setValueAtTime(rand(-3, 3), t);
+
+  // 第二振荡器：轻微失谐增加厚度
+  const osc2 = audioCtx.createOscillator();
+  osc2.type = midiNote < 60 ? 'sine' : 'triangle';
+  osc2.frequency.setValueAtTime(baseFreq, t);
+  osc2.detune?.setValueAtTime(rand(8, 15), t);
+
+  // Sub 振荡器：低音区增强
+  let subOsc = null;
+  if (midiNote < 72) {
+    subOsc = audioCtx.createOscillator();
+    subOsc.type = 'sine';
+    subOsc.frequency.setValueAtTime(baseFreq * 0.5, t);
   }
-  gain.gain.exponentialRampToValueAtTime(0.08, audioCtx.currentTime + 0.05);
-  gain.gain.exponentialRampToValueAtTime(0.001, audioCtx.currentTime + 0.25);
-  osc.start(audioCtx.currentTime);
-  osc.stop(audioCtx.currentTime + 0.25);
+
+  // 滤波器：低通，带包络
+  const filter = audioCtx.createBiquadFilter();
+  filter.type = 'lowpass';
+  filter.frequency.setValueAtTime(400, t);
+  filter.Q.setValueAtTime(1.5, t);
+  filter.frequency.exponentialRampToValueAtTime(4000 + midiNote * 30, t + 0.02);
+  filter.frequency.exponentialRampToValueAtTime(800 + midiNote * 15, t + 0.15);
+  if (sustained) {
+    filter.frequency.setValueAtTime(1200 + midiNote * 10, t + 0.2);
+  } else {
+    filter.frequency.exponentialRampToValueAtTime(600, t + 0.2);
+  }
+
+  // 主增益 + ADSR
+  const gain = audioCtx.createGain();
+  const amp = 0.18 * v;
+  gain.gain.setValueAtTime(0.001, t);
+  gain.gain.linearRampToValueAtTime(amp * 0.9, t + 0.008);
+  gain.gain.exponentialRampToValueAtTime(amp * 0.5, t + 0.06);
+  if (sustained) {
+    gain.gain.exponentialRampToValueAtTime(amp * 0.35, t + 0.1);
+    gain.gain.setValueAtTime(amp * 0.35, t + 1);
+  } else {
+    gain.gain.exponentialRampToValueAtTime(0.001, t + 0.22);
+  }
+
+  // 连接：osc -> filter -> gain -> destination
+  osc1.connect(filter);
+  osc2.connect(filter);
+  if (subOsc) {
+    subOsc.connect(filter);
+    subOsc.start(t);
+  }
+  filter.connect(gain);
+  gain.connect(masterGain);
+  osc1.start(t);
+  osc2.start(t);
+
+  //  sustained 颤音 LFO
+  let lfoOsc = null;
+  if (sustained) {
+    lfoOsc = audioCtx.createOscillator();
+    lfoOsc.type = 'sine';
+    lfoOsc.frequency.setValueAtTime(5, t);
+    const lfoGain = audioCtx.createGain();
+    lfoGain.gain.setValueAtTime(8, t);
+    lfoOsc.connect(lfoGain);
+    lfoGain.connect(osc1.detune);
+    lfoGain.connect(osc2.detune);
+    lfoOsc.start(t);
+  }
+
+  const stop = (releaseTime = 0.08) => {
+    const tEnd = audioCtx.currentTime;
+    gain.gain.setValueAtTime(gain.gain.value, tEnd);
+    gain.gain.exponentialRampToValueAtTime(0.001, tEnd + releaseTime);
+    osc1.stop(tEnd + releaseTime);
+    osc2.stop(tEnd + releaseTime);
+    if (subOsc) subOsc.stop(tEnd + releaseTime);
+    if (lfoOsc) lfoOsc.stop(tEnd + releaseTime);
+  };
+
+  return { osc1, osc2, subOsc, filter, gain, lfoOsc, stop };
+}
+
+// 和弦趣味：3+ 键添加高谐波闪烁；5+ 键额外加低音 Pad
+function playChordSparkle(midiNotes) {
+  if (midiNotes.length < 3) return;
+  const t = audioCtx.currentTime;
+  const highFreq = midiToFreq(84) * (1 + Math.random() * 0.1);
+  const sparkle = audioCtx.createOscillator();
+  sparkle.type = 'sine';
+  sparkle.frequency.setValueAtTime(highFreq, t);
+  const g = audioCtx.createGain();
+  g.gain.setValueAtTime(0.06, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t + 0.15);
+  sparkle.connect(g);
+  g.connect(masterGain);
+  sparkle.start(t);
+  sparkle.stop(t + 0.15);
+  if (midiNotes.length >= 5) {
+    const lowPad = audioCtx.createOscillator();
+    lowPad.type = 'sine';
+    lowPad.frequency.setValueAtTime(midiToFreq(36), t);
+    const pg = audioCtx.createGain();
+    pg.gain.setValueAtTime(0.04, t);
+    pg.gain.exponentialRampToValueAtTime(0.001, t + 0.4);
+    lowPad.connect(pg);
+    pg.connect(masterGain);
+    lowPad.start(t);
+    lowPad.stop(t + 0.4);
+  }
+}
+
+function playPlaceholderSound(midiNote, cellIndex, sustained = false, velocity = 1, chordNotes = []) {
+  // 趣味：和弦时加 sparkle
+  if (chordNotes.length >= 3) {
+    playChordSparkle(chordNotes);
+    document.body.classList.add('chord-flash');
+    setTimeout(() => document.body.classList.remove('chord-flash'), 120);
+  }
+
+  const voice = createSynthVoice(midiNote, cellIndex, sustained, velocity);
+  if (sustained) {
+    return { ...voice, stop: voice.stop };
+  }
+  voice.osc1.stop(audioCtx.currentTime + 0.25);
+  voice.osc2.stop(audioCtx.currentTime + 0.25);
+  if (voice.subOsc) voice.subOsc.stop(audioCtx.currentTime + 0.25);
 }
 
 function stopSustained(key) {
   const s = activeSustained[key];
-  if (s) {
-    const t = audioCtx.currentTime;
-    s.gain.gain.setValueAtTime(s.gain.gain.value, t);
-    s.gain.gain.exponentialRampToValueAtTime(0.001, t + 0.08);
-    s.osc.stop(t + 0.08);
+  if (s && s.stop) {
+    s.stop(0.08);
     delete activeSustained[key];
   }
 }
@@ -198,24 +331,31 @@ function bindEvents() {
 
   // 键盘：全音阶 QWERTY，C/D/E/F 持续
   const keysPressed = new Set();
+  const getChordNotes = () => Array.from(keysPressed).map(k => KEY_TO_NOTE[k]?.midi).filter(Boolean);
   document.addEventListener('keydown', (e) => {
     if (e.repeat) return;
     const key = e.key.toLowerCase();
     const note = KEY_TO_NOTE[key];
     if (note && !keysPressed.has(key)) {
       keysPressed.add(key);
+      keysPressedCount = keysPressed.size;
       e.preventDefault();
       const sustained = SUSTAIN_OFFSETS.has(note.midi % 12);
+      const chordNotes = getChordNotes();
+      const velocity = 0.8 + Math.random() * 0.2;
       triggerCell(note.cell, { clientX: window.innerWidth / 2, clientY: window.innerHeight / 2 }, {
         midiNote: note.midi,
         sustained,
         key: sustained ? key : undefined,
+        chordNotes,
+        velocity,
       });
     }
   });
   document.addEventListener('keyup', (e) => {
     const key = e.key.toLowerCase();
     keysPressed.delete(key);
+    keysPressedCount = keysPressed.size;
     if (KEY_TO_NOTE[key] && SUSTAIN_OFFSETS.has(KEY_TO_NOTE[key].midi % 12)) {
       stopSustained(key);
     }
@@ -234,6 +374,16 @@ function getMousePos(e) {
 
 function triggerCell(index, e, opts = {}) {
   lastTriggeredCell = index;
+
+  // 趣味：鼠标点击根据距离中心计算力度
+  let velocity = opts?.velocity;
+  if (velocity == null && e?.clientX != null) {
+    const dx = e.clientX - window.innerWidth / 2;
+    const dy = e.clientY - window.innerHeight / 2;
+    const dist = Math.min(1, Math.hypot(dx, dy) / (Math.min(window.innerWidth, window.innerHeight) * 0.4));
+    velocity = 0.6 + dist * 0.5;
+  }
+  if (velocity == null) velocity = 0.85 + Math.random() * 0.15;
 
   const nextBgIndex = (bgIndex + 1) % BG_PALETTE.length;
   const darkBgs = ['#000000', '#0A0A0A', '#0D0D0D', '#0A1628', '#1C3A5C', '#1A1A1A'];
@@ -254,12 +404,13 @@ function triggerCell(index, e, opts = {}) {
   const midi = opts?.midiNote ?? 48 + index;
   const sustained = opts?.sustained ?? false;
   const key = opts?.key;
+  const chordNotes = opts?.chordNotes ?? [];
   if (sustained && key) {
     stopSustained(key);
-    const s = playPlaceholderSound(midi, index, true);
+    const s = playPlaceholderSound(midi, index, true, velocity, chordNotes);
     if (s) activeSustained[key] = s;
   } else {
-    playPlaceholderSound(midi, index, false);
+    playPlaceholderSound(midi, index, false, velocity, chordNotes);
   }
 
   // 同格点击：移除该格已有动画，重启动画而非叠加
